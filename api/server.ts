@@ -5,6 +5,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import axios from "axios";
 import logger from "./logger.ts";
+import { CohereResponse, FactCheckResult, SourceOptions, SourceResult } from "./interface.ts";
 dotenv.config();
 
 const app :Application = express();
@@ -17,6 +18,12 @@ app.use((req:Request, res:Response, next: NextFunction) => {
   next();
 });
 
+app.get("/health", (req: Request, res: Response) => {
+  res.status(200).json({
+    message: `Hey ${req.ip}! ReadCheckAI is working fine...`,
+    status: "ok"
+  });
+});
 
 // Helper: Extract JSON from mixed response text
 function extractJsonFromText(text: string): any[] {
@@ -33,34 +40,12 @@ function extractJsonFromText(text: string): any[] {
     const jsonChunk = text.slice(start, end);
     return JSON.parse(jsonChunk);
   } catch (err: any) {
-    console.error("❌ Failed to extract JSON:", err.message);
+    logger.error("Failed to extract JSON:", err.message);
     return [];
   }
 }
 
-interface SourceOptions {
-  maxSources?: number;
-  includeFactCheckSites?: boolean;
-  includeTrustedDomains?: boolean;
-  retryCount?: number;
-  timeout?: number;
-  verbose?: boolean;
-  currentRetry?: number;
-}
 
-interface SourceResult {
-  title: string;
-  snippet: string;
-  link: string;
-  source: string;
-  relevanceScore: number;
-  rank: number;
-}
-interface CohereResponse {
-  message?: {
-    content?: { text: string }[];
-  };
-}
 /**
  * Fetches and validates fact-checking sources for a claim
  */
@@ -75,6 +60,7 @@ async function fetchSources(claim: string, options: SourceOptions = {}): Promise
   };
 
   const trustedFactCheckDomains = [
+    // Core Global Fact-Checkers (IFCN-verified)
     "factcheck.org",
     "politifact.com",
     "snopes.com",
@@ -82,15 +68,37 @@ async function fetchSources(claim: string, options: SourceOptions = {}): Promise
     "apnews.com/hub/fact-checking",
     "bbc.com/news/reality_check",
     "fullfact.org",
-    "factcheck.afp.com",
+    "factcheck.afp.com", // AFP Fact Check (global)
     "usatoday.com/fact-check",
     "washingtonpost.com/fact-checker",
-  ];
 
+    // Additional High-Quality Fact-Checkers
+    "leadstories.com", // Debunks viral hoaxes
+    "sciencefeedback.co", // Science/health claims
+    "healthfeedback.org", // Medical misinformation
+    "chequeado.com", // Argentina (IFCN-certified)
+    "aosfatos.org", // Brazil (IFCN-certified)
+    "africacheck.org", // Africa-focused
+    "boomlive.in", // India (IFCN-certified)
+    "altnews.in", // India (debunks misinformation)
+    "euvsdisinfo.eu", // EU vs. Russian disinfo
+    "ifcn.org", // Poynter’s fact-checking network
+
+    // U.S. Regional/Partisan Balance
+    "flackcheck.org", // Annenberg’s political checks
+    "factcheckni.org", // Northern Ireland
+    "theferret.scot", // Scotland
+
+    // Tools & Aggregators
+    "toolbox.google.com/factcheck", // Google Fact Check Explorer
+    "archive.org", // Wayback Machine (for source verification)
+  ];
+  // Pre-compiled fact check terms for scoring
+  const factCheckTerms: string[] = ['fact check', 'fact-check', 'debunk', 'verify', 'false', 'true', 'myth', 'claim'];
   const cleanedClaim = claim.replace(/[^\w\s]/gi, " ").trim();
 
   try {
-    console.log(`🔎 Searching for sources on: "${cleanedClaim}"`);
+    logger.info(`[fetchSources] Searching sources for: "${cleanedClaim}"`);
 
     const searchQueries = [{ q: cleanedClaim, label: "General" }];
 
@@ -118,22 +126,23 @@ async function fetchSources(claim: string, options: SourceOptions = {}): Promise
           queryType: queryObj.label,
         }));
 
-        allResults = [...allResults, ...results];
+        allResults = [...results];
 
         if (config.verbose) {
-          console.log(`📊 Found ${results.length} results for "${queryObj.label}" query`);
+          logger.info(`Found ${results.length} results for "${queryObj.label}" query`);
         }
       } catch (innerErr: any) {
-        console.error(`Error with "${queryObj.label}" search:`, innerErr.message);
+        logger.error(`Error with "${queryObj.label}" search:`, innerErr.message);
       }
     }
-
+    const trustedDomainsSet = new Set(trustedFactCheckDomains)
     const processedResults: SourceResult[] = allResults
       .filter((r) => r.title && r.link)
       .map((r) => {
         let score = 0;
-
-        if (config.includeTrustedDomains && trustedFactCheckDomains.some((domain) => r.link.includes(domain))) {
+        const url = new URL(r.link); // First parse the URL
+        const domain = url.hostname.replace('www.', ''); // Then extract and clean the domain
+        if (config.includeTrustedDomains && trustedDomainsSet.has(domain)) {
           score += 10;
         }
 
@@ -151,7 +160,7 @@ async function fetchSources(claim: string, options: SourceOptions = {}): Promise
           if (r.snippet && r.snippet.toLowerCase().includes(keyword)) score += 0.5;
         });
 
-        const factCheckTerms = ["fact check", "fact-check", "debunk", "verify", "false", "true"];
+        // const factCheckTerms = ["fact check", "fact-check", "debunk", "verify", "false", "true"];
         factCheckTerms.forEach((term) => {
           if (r.title.toLowerCase().includes(term)) score += 2;
           if (r.snippet && r.snippet.toLowerCase().includes(term)) score += 1;
@@ -170,13 +179,13 @@ async function fetchSources(claim: string, options: SourceOptions = {}): Promise
       .slice(0, config.maxSources)
       .map((r, index) => ({ ...r, rank: index + 1 }));
 
-    console.log(`✅ Successfully found ${processedResults.length} relevant sources`);
+    logger.info(`Successfully found ${processedResults.length} relevant sources`);
     return processedResults;
   } catch (err: any) {
-    console.error("❌ Source fetch error:", err.message);
+    logger.error("Source fetch error:", err.message);
 
     if (options.currentRetry && options.currentRetry < config.retryCount) {
-      console.log(`🔄 Retrying source fetch (${options.currentRetry + 1}/${config.retryCount})...`);
+      logger.info(`🔄 Retrying source fetch (${options.currentRetry + 1}/${config.retryCount})...`);
       return fetchSources(claim, {
         ...options,
         currentRetry: (options.currentRetry || 0) + 1,
@@ -187,14 +196,9 @@ async function fetchSources(claim: string, options: SourceOptions = {}): Promise
   }
 }
 
-interface FactCheckResult {
-  sentence: string;
-  sources?: SourceResult[];
-}
-
 async function checkSentences(sentences: string): Promise<FactCheckResult[]> {
   if (!sentences || sentences.length === 0) {
-    console.log("No sentences to check");
+    logger.info("No sentences to check");
     return [];
   }
 
@@ -250,21 +254,21 @@ async function checkSentences(sentences: string): Promise<FactCheckResult[]> {
 
   const data = (await response.json()) as CohereResponse;
   const extractedText = data.message?.content?.[0]?.text || "";
-  console.log("📩 Extracted JSON:\n", extractedText);
+  logger.info("📩 Extracted JSON:\n", extractedText);
 
   try {
     const parsed: FactCheckResult[] = extractJsonFromText(extractedText);
 
     const results: FactCheckResult[] = [];
     for (const result of parsed) {
-      console.log(`🔗 Fetching sources for inaccurate claim: "${result.sentence}"`);
+      logger.info(`🔗 Fetching sources for inaccurate claim: "${result.sentence}"`);
       result.sources = await fetchSources(result.sentence);
       results.push(result);
     }
 
     return results;
   } catch (error) {
-    console.error("Error processing AI response:", error);
+    logger.error("Error processing AI response:", error);
     return [];
   }
 }
@@ -281,14 +285,14 @@ app.post("/fact-check-article", async (req: Request, res: Response): Promise<voi
 
   try {
     const claims= await checkSentences(article);
-    logger.info(`❌ Found ${claims.length} inaccurate claim(s).`);
-    res.status(200).json({ claims });
-  } catch (error) {
+    logger.info(`Found ${claims.length} inaccurate claim(s).`);
+    res.status(200).json({ success: true, message: "Fact check completed", claims });
+  } catch (error: any) {
     logger.error("Fact-check article error:", error);
-     res.status(500).json({ error: "Something went wrong." });
+    res.status(500).json({ success: false, message: "Something went wrong.", error: error.message });
   }
 });
 
 app.listen(PORT, () => {
-  logger.info(`✅ Server running on http://localhost:${PORT}`);
+  logger.info(`Server running on http://localhost:${PORT}`);
 });
